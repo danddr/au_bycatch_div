@@ -1,0 +1,754 @@
+## Generated from austria_bycatch_diversity.Rmd with knitr::purl(documentation = 2).
+## Edit the Rmd, not this file. Prose (questions, assumptions) is kept as #' comments.
+
+params <-
+list(infile = "austria_insect_taxdiv.xlsx", show_code = FALSE)
+
+#' ---
+#' title: "Austrian BG-trap bycatch: order-level diversity by year, season and trap type"
+#' author: "Daniele Da Re"
+#' date: "`r format(Sys.Date(), '%d %B %Y')`"
+#' params:
+#'   infile: "austria_insect_taxdiv.xlsx"
+#'   show_code: false
+#' output:
+#'   pdf_document:
+#'     toc: true
+#'     number_sections: true
+#'     fig_caption: true
+#' geometry: margin=2cm
+#' fontsize: 10pt
+#' header-includes:
+#'   - \usepackage{booktabs}
+#'   - \usepackage{float}
+#'   - \usepackage{caption}
+#'   - \captionsetup[table]{labelformat=empty}
+#'   - \floatplacement{figure}{H}
+#' ---
+#' 
+## ----setup, include = FALSE---------------------------------------------------
+## When run as a plain R script (generated with knitr::purl), params does not exist
+if (!exists("params")) params <- list(infile = "austria_insect_taxdiv.xlsx", show_code = FALSE)
+
+knitr::opts_chunk$set(echo = params$show_code, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 4.5,
+                      fig.pos = "H")
+options(width = 120, knitr.kable.NA = "")
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(glmmTMB)
+library(emmeans)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+month_levels <- c("Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct")
+ref_year     <- 2022   # reference year: inside the series of every trap type
+ref_month    <- 7      # reference month: July
+
+knitting <- isTRUE(getOption("knitr.in.progress"))
+
+## ---- helpers ------------------------------------------------------------------
+## Table: LaTeX when knitting, plain print-out when run as an R script
+tab <- function(df, caption, digits = 2, font = 8) {
+  if (!knitting) {
+    cat("\n", gsub("\\\\%", "%", caption), "\n", sep = "")
+    print(as.data.frame(df), row.names = FALSE, digits = 4)
+    return(invisible(df))
+  }
+  kbl(df, booktabs = TRUE, caption = caption, digits = digits, linesep = "",
+      row.names = FALSE) |>
+    kable_styling(latex_options = c("HOLD_position", "scale_down"), font_size = font)
+}
+
+## Readable model terms
+term_lab <- function(x) {
+  x <- gsub("trapBG Sentinel \\+ CO2 \\+ Lure", "Lure", x)
+  x <- gsub("trapBG Sentinel \\+ Yeast", "Yeast", x)
+  x <- gsub("I\\(month_c\\^2\\)", "month²", x)
+  x <- gsub("month_c", "month", x)
+  x <- gsub("year_c", "year", x)
+  x <- gsub("logN", "log catch", x)
+  x <- gsub(":", " × ", x)
+  x[x == "(Intercept)"] <- paste0("intercept (CO2, July ", ref_year, ")")
+  x
+}
+
+coef_tab <- function(m, caption) {
+  co <- summary(m)$coefficients$cond
+  data.frame(term = term_lab(rownames(co)), estimate = co[, 1], SE = co[, 2],
+             z = co[, 3], p = format.pval(co[, 4], digits = 2, eps = 1e-4),
+             row.names = NULL) |>
+    tab(caption = caption, digits = 3)
+}
+
+wald_df <- function(m, response) {
+  a <- car::Anova(m, type = 3)
+  data.frame(response = response, term = term_lab(rownames(a)),
+             Chisq = a$Chisq, Df = a$Df, p_raw = a[, "Pr(>Chisq)"]) |>
+    filter(!grepl("^intercept", term))
+}
+
+trend_df <- function(m) {
+  tr <- as.data.frame(emtrends(m, ~ trap, var = "year_c"))
+  names(tr) <- c("trap", "slope", "SE", "df", "lower", "upper")
+  tr |> select(-df)
+}
+
+## % change per year for log-link (or log-scale) responses
+pct_df <- function(m, response) {
+  trend_df(m) |>
+    transmute(response = response, trap,
+              `% per year` = round(100 * (exp(slope) - 1), 1),
+              lower = round(100 * (exp(lower) - 1), 1),
+              upper = round(100 * (exp(upper) - 1), 1))
+}
+
+fmt_pct <- function(pt, resp, trap_name) {
+  r <- pt[pt$response == resp & pt$trap == trap_name, ]
+  sprintf("%+.1f%% per year (95%% CI %+.1f to %+.1f)", r$`% per year`, r$lower, r$upper)
+}
+
+blank_rep <- function(df, col = 1) {
+  x <- as.character(df[[col]])
+  x[c(FALSE, x[-1] == x[-length(x)])] <- ""        # blank consecutive repeats only
+  df[[col]] <- x; df
+}
+
+pv <- function(w, resp, term) {
+  format.pval(w$p_raw[w$response == resp & w$term == term], digits = 2, eps = 1e-4)
+}
+pnum <- function(w, resp, term) w$p_raw[w$response == resp & w$term == term]
+sig_word <- function(p) ifelse(p < 0.05, "significant", "not significant")
+
+disp_ratio <- function(m) sum(residuals(m, type = "pearson")^2) / df.residual(m)
+
+#' 
+#' # Data and assumptions
+#' 
+## ----read-data----------------------------------------------------------------
+## ---- 1. Read -----------------------------------------------------------------
+raw <- read_excel(params$infile, sheet = "bycatch_longtable")
+names(raw) <- c("order", "region", "trap", "year", month_levels)
+
+## ---- 2. Long format + zero-filling (ASSUMPTION, to be confirmed) --------------
+## The sheet contains NO zeros: NA means either "not sampled" or "none caught".
+## A region x trap x year x month cell is sampled if at least one order was
+## recorded; within sampled cells NA -> 0. Fully empty cells are dropped.
+long_all <- raw |>
+  pivot_longer(all_of(month_levels), names_to = "month", values_to = "n") |>
+  mutate(month = factor(month, levels = month_levels))
+
+cells <- long_all |>
+  group_by(region, trap, year, month) |>
+  summarise(sampled = any(!is.na(n)), .groups = "drop")
+
+long <- long_all |>
+  semi_join(filter(cells, sampled), by = c("region", "trap", "year", "month")) |>
+  mutate(n = replace_na(n, 0))
+
+## ---- 3. Diversity per sampling cell (region x trap x year x month) ------------
+div <- long |>
+  group_by(region, trap, year, month) |>
+  summarise(
+    N         = sum(n),
+    richness  = sum(n > 0),
+    shannon   = { p <- n[n > 0] / sum(n); -sum(p * log(p)) },   # H
+    diptera   = sum(n[order == "Diptera"]),
+    .groups   = "drop"
+  ) |>
+  mutate(
+    hill1     = exp(shannon),          # exp(H): effective number of orders
+    diptera_p = diptera / N,
+    month_n   = as.integer(month) + 3, # 4 = April ... 10 = October
+    month_c   = month_n - ref_month,   # relative to July
+    year_c    = year - ref_year,
+    logN      = log(N)
+  )
+
+tot <- long |> group_by(order) |> summarise(n = sum(n))
+
+#' 
+#' The input is the `bycatch_longtable` sheet: counts of `r n_distinct(raw$order)` taxa (insect orders plus other arthropods and slugs, all retained), pooled by region, trap type, year and month. The sampling unit is therefore one region × trap type × year × month, here called a *sampled month*. There are `r nrow(div)` sampled months with `r format(sum(tot$n), big.mark = ",")` individuals in total.
+#' 
+#' **Zero-filling assumption (to be confirmed by the data collectors).** The sheet contains no zeros, so an empty cell may mean "not sampled" or "none caught". A month is treated as sampled if at least one taxon was recorded in it; empty cells within a sampled month are set to zero. Months with no records at all are treated as not sampled.
+#' 
+#' # Data summary: sampling coverage and variability
+#' 
+## ----summary-tables-----------------------------------------------------------
+## T1. Sampling coverage: number of months with any record, per year
+t1_coverage <- cells |>
+  group_by(region, trap, year) |>
+  summarise(months_sampled = sum(sampled), .groups = "drop") |>
+  pivot_wider(names_from = year, values_from = months_sampled,
+              names_sort = TRUE, values_fill = 0) |>
+  arrange(region, trap)
+
+## T2. Which months were sampled (pooled over years)
+t2_months <- cells |>
+  filter(sampled) |>
+  count(region, trap, month) |>
+  pivot_wider(names_from = month, values_from = n, values_fill = 0,
+              names_sort = TRUE) |>
+  arrange(region, trap)
+
+## T3. Unsampled months between the first and last sampled month of a year
+t3_gaps <- cells |>
+  group_by(region, trap, year) |>
+  filter(any(sampled)) |>
+  mutate(m = as.integer(month),
+         first = min(m[sampled]), last = max(m[sampled])) |>
+  filter(!sampled, m > first, m < last) |>
+  summarise(missing_months = paste(month, collapse = ", "), .groups = "drop") |>
+  arrange(region, trap, year)
+
+## T4. Recording protocol: taxa listed in the template vs ever recorded (> 0)
+t4_orders <- raw |>
+  pivot_longer(all_of(month_levels), values_to = "n") |>
+  group_by(region, trap) |>
+  summarise(taxa_listed   = n_distinct(order),
+            taxa_recorded = n_distinct(order[!is.na(n) & n > 0]),
+            .groups = "drop")
+
+## T5. Catch size and composition per sampled month
+t5_catch <- div |>
+  group_by(region, trap) |>
+  summarise(
+    months          = n(),
+    years           = paste(unique(range(year)), collapse = "-"),
+    N_median        = median(N),
+    N_min           = min(N),
+    N_max           = max(N),
+    max_min_ratio   = round(max(N) / min(N), 1),
+    N_CV            = round(sd(N) / mean(N), 2),
+    richness_median = median(richness),
+    richness_range  = paste(range(richness), collapse = "-"),
+    diptera_share   = round(median(diptera_p), 2),
+    .groups = "drop"
+  ) |>
+  arrange(region, trap)
+
+## T6. Year-to-year variability: catch per sampled month
+t6_annual <- div |>
+  group_by(region, trap, year) |>
+  summarise(months = n(), N_total = sum(N),
+            N_per_month = round(sum(N) / n()),
+            richness_max = max(richness), .groups = "drop") |>
+  arrange(region, trap, year)
+
+## T7. Design confounding: sampled months per trap x year and trap x region
+t7_trap_year   <- div |> count(trap, year) |>
+  pivot_wider(names_from = year, values_from = n, values_fill = 0, names_sort = TRUE)
+t7_trap_region <- div |> count(trap, region) |>
+  pivot_wider(names_from = region, values_from = n, values_fill = 0)
+
+
+rare_orders <- sum(tot$n <= 30)
+dip_share   <- sum(tot$n[tot$order == "Diptera"]) / sum(tot$n)
+worst       <- t5_catch |> slice_max(max_min_ratio, n = 1)
+
+#' 
+#' Key points for the data collectors:
+#' 
+#' - **Catch varies by orders of magnitude within a series.** In `r worst$region`, `r worst$trap`, monthly catch ranges from `r worst$N_min` to `r worst$N_max` individuals (`r round(worst$max_min_ratio)`-fold). Without trapping effort we cannot tell fewer insects from fewer traps or trap-nights (Table T5).
+#' - **Recording protocols differ.** Salzburg and Styria list only 2 to 3 taxa; Upper Austria (CO2, 2014-2015) and Tyrol record 6 and 5 of 26 (Table T4).
+#' - **Coverage is uneven.** Months sampled per year range from 1 to 7, and April was sampled only in 2014 and 2015 (Tables T1 and T2). Three months are missing inside otherwise sampled seasons (Table T3).
+#' - **Trap type, region and period overlap.** Each trap type was used in different regions and years (Table T7), so a trap effect cannot be fully separated from a place or period effect.
+#' - **The catch is dominated by Diptera** (`r round(100 * dip_share)`% of all individuals), and `r rare_orders` of the 26 taxa total 30 individuals or fewer.
+#' 
+## ----t1-----------------------------------------------------------------------
+tab(t1_coverage, "T1. Number of months sampled per year.", font = 7)
+
+#' 
+## ----t2-----------------------------------------------------------------------
+tab(t2_months, "T2. Number of sampled months by calendar month, pooled over years.")
+
+#' 
+## ----t3-----------------------------------------------------------------------
+tab(t3_gaps, "T3. Unsampled months inside an otherwise sampled season: true zero catch or no trapping?")
+
+#' 
+## ----t4-----------------------------------------------------------------------
+tab(t4_orders, "T4. Taxa listed in the data template and taxa recorded at least once.")
+
+#' 
+## ----t5-----------------------------------------------------------------------
+tab(t5_catch, "T5. Catch size (individuals per sampled month), richness and Diptera share by region and trap type.", font = 7)
+
+#' 
+## ----t7-----------------------------------------------------------------------
+tab(t7_trap_year, "T7a. Sampled months per trap type and year.", font = 7)
+tab(t7_trap_region, "T7b. Sampled months per trap type and region.")
+
+#' 
+#' Table T6 (catch per year) is in the Appendix.
+#' 
+#' # Modelling approach
+#' 
+#' ## Response variables
+#' 
+## ----subset-------------------------------------------------------------------
+## Salzburg and Styria list only 2-3 taxa: richness capped by protocol.
+incomplete <- t4_orders |> filter(taxa_listed < 10) |> pull(region) |> unique()
+
+## BG Pro + Yeast = Tyrol 2025 only (3 months): no trend or season estimable.
+div_m <- div |>
+  filter(trap != "BG Pro + Yeast", !region %in% incomplete) |>
+  mutate(trap = factor(trap), region = factor(region)) |>
+  droplevels()
+
+cor_H_dip <- cor(div_m$shannon, div_m$diptera_p)
+cor_H_N   <- cor(div_m$shannon, div_m$logN)
+cor_S_N   <- cor(div_m$richness, div_m$logN)
+
+#' 
+#' Three diversity responses are computed for each sampled month:
+#' 
+#' - **Order richness** (*S*): number of taxa with at least one individual. Sensitive to rare taxa, and therefore to sampling effort.
+#' - **Shannon diversity**, reported as **exp(*H*)**: the *effective number of orders*, i.e. the number of equally common orders that would give the observed Shannon index *H*. Unlike *S*, it weights orders by their abundance.
+#' - **Diptera share**: the proportion of individuals that are Diptera.
+#' 
+#' These responses are not independent. Richness rises strongly with catch size (r = `r round(cor_S_N, 2)` with log catch), whereas Shannon *H* barely does (r = `r round(cor_H_N, 2)`). Shannon is driven instead by the Diptera share (r = `r round(cor_H_dip, 2)`).
+#' 
+#' ## Modelling subset
+#' 
+#' Salzburg and Styria are excluded because their richness is capped by the recording protocol (Table T4). BG Pro + Yeast is excluded because it was used only in Tyrol in 2025 (3 months), so no trend or season can be estimated for it. The models use **`r nrow(div_m)` sampled months** from `r nlevels(div_m$region)` regions (`r paste(levels(div_m$region), collapse = ", ")`) and `r nlevels(div_m$trap)` trap types.
+#' 
+#' ## Common model structure
+#' 
+#' All monthly models share the same fixed-effect structure:
+#' 
+#' `response ~ trap × year + trap × (month + month²) + (1 | region)`
+#' 
+#' Each term answers a specific question:
+#' 
+## ----terms-table--------------------------------------------------------------
+terms_q <- data.frame(
+  term = c("trap", "year", "trap × year", "month, month²",
+           "trap × month, trap × month²", "(1 | region)"),
+  question = c(
+    paste0("Do trap types differ, in July ", ref_year, "?"),
+    "Is there a trend across years (for the CO2 trap)?",
+    "Does the year trend differ between trap types?",
+    "Is there a seasonal pattern, with a single peak or trough?",
+    "Does the seasonal pattern differ between trap types?",
+    "Regions differ in their baseline level; not a question, a nuisance term."
+  ))
+tab(terms_q, "Model terms and the question each one tests.")
+
+#' 
+#' **Year and month are expressed relative to a reference point**, `r ref_year` and July (year - `r ref_year`, month - 7; both remain whole numbers). This does not change trends, predictions or the tests of interactions. It only means that the trap differences in the tables refer to July `r ref_year`, a point inside every trap's series, rather than to "year 0". All results below are reported in natural units.
+#' 
+#' **Assumptions shared by all monthly models:**
+#' 
+#' 1. Empty cells within a sampled month are true zeros (Section 1).
+#' 2. **Sampling effort is constant** across regions, traps and years. This is the strongest assumption and cannot be checked without effort data.
+#' 3. The trend is linear on the model scale (constant % change per year), and the season is a smooth curve with at most one peak.
+#' 4. Sampled months are independent once region is accounted for. This is checked in Section 6.
+#' 5. With only `r nlevels(div_m$region)` regions, the region variance is poorly estimated. This is checked in Section 6.
+#' 
+#' ## Model overview
+#' 
+## ----overview-----------------------------------------------------------------
+overview <- data.frame(
+  model = c("M1", "M2", "M3", "M4"),
+  question = c(
+    "Does the number of orders change with year and season, and differently by trap type?",
+    "Does it change once differences in catch size are accounted for?",
+    "Does the effective number of orders, exp(H), change with year and season?",
+    "Does the share of Diptera in the catch change with year and season?"),
+  response = c("S (count)", "S (count)", "H (exp(H) reported)", "Diptera / total individuals"),
+  distribution = c("Poisson, log link", "Poisson, log link", "Gaussian, identity link on H",
+                   "Beta-binomial, logit link"),
+  extra_terms = c("", "+ log catch", "", ""),
+  n = nrow(div_m))
+tab(overview, "Overview of the monthly models. All share the structure trap × year + trap × (month + month²) + (1 | region).")
+
+#' 
+#' \newpage
+#' 
+#' # Models
+#' 
+## ----formula------------------------------------------------------------------
+f_fix <- ~ trap * year_c + trap * (month_c + I(month_c^2))
+
+#' 
+#' ## M1: order richness
+#' 
+#' - **Question.** Does the number of orders caught per month change across years and seasons, and does this differ between trap types?
+#' - **Response.** Number of taxa with at least one individual (count, 0 to 26).
+#' - **Distribution.** Poisson with log link: richness is a count, and coefficients become % changes.
+#' - **Dispersion.** The Poisson assumes variance equal to the mean. Richness is a bounded count and is *under*-dispersed here (ratio below). We keep the Poisson and do not correct for this: under-dispersion makes Poisson standard errors too wide, so tests are conservative. The effect on the conclusions is checked in Section 6. A negative binomial is not an option because it can only model over-dispersion; fitted here, it collapses to the Poisson.
+#' - **Specific assumptions.** Richness depends on how many individuals were caught, which this model ignores (see M2).
+#' 
+## ----m1-----------------------------------------------------------------------
+m1 <- glmmTMB(update(f_fix, richness ~ . + (1 | region)),
+              family = poisson, data = div_m)
+disp_m1 <- disp_ratio(m1)
+
+#' 
+#' Pearson dispersion ratio: **`r round(disp_m1, 2)`** (1 = Poisson-like; < 1 = under-dispersed).
+#' 
+## ----m1-coef------------------------------------------------------------------
+coef_tab(m1, paste0("M1. Order richness, Poisson GLMM (log scale). Lure and Yeast: difference from CO2 in July ", ref_year, "; × year and × month terms: difference in slope from CO2."))
+
+#' 
+#' ## M2: order richness adjusted for catch size
+#' 
+#' - **Question.** Are differences in richness explained simply by how many individuals were caught? Catch size is used as a proxy for the unknown sampling effort.
+#' - **Response and distribution.** As in M1 (Poisson, log link, no correction for under-dispersion).
+#' - **Extra term.** log(total catch).
+#' - **Specific assumptions.** Catch size reflects both effort and true insect abundance. Adjusting for it removes effort differences, but it may also remove genuine abundance-driven changes in diversity. M2 is therefore conservative: an effect that survives M2 is unlikely to be an effort artefact.
+#' 
+## ----m2-----------------------------------------------------------------------
+m2 <- glmmTMB(update(f_fix, richness ~ . + logN + (1 | region)),
+              family = poisson, data = div_m)
+disp_m2 <- disp_ratio(m2)
+
+#' 
+#' Pearson dispersion ratio: **`r round(disp_m2, 2)`**.
+#' 
+## ----m2-coef------------------------------------------------------------------
+coef_tab(m2, paste0("M2. Order richness adjusted for log catch, Poisson GLMM (log scale). Terms as in M1."))
+
+#' 
+#' ## M3: Shannon diversity, exp(H)
+#' 
+#' - **Question.** Does the effective number of orders, exp(*H*), change across years and seasons, and does this differ between trap types?
+#' - **Response.** Shannon index *H* per sampled month.
+#' - **Distribution.** Gaussian with identity link on *H*. Because *H* = log(exp(*H*)), this is a log-scale model of exp(*H*): a coefficient $\beta$ means exp(*H*) is multiplied by exp($\beta$), so results are reported as % changes in the effective number of orders, as for richness.
+#' - **Specific assumptions.** Residuals of *H* are approximately normal with constant variance. *H* is bounded at zero (months with a single order), which the Gaussian ignores; only `r sum(div_m$shannon == 0)` sampled months have *H* = 0. Shannon depends much less on catch size than richness does, so no catch-size adjustment is made.
+#' 
+## ----m3-----------------------------------------------------------------------
+m3 <- glmmTMB(update(f_fix, shannon ~ . + (1 | region)),
+              family = gaussian, data = div_m)
+
+#' 
+## ----m3-coef------------------------------------------------------------------
+coef_tab(m3, paste0("M3. Shannon H, Gaussian GLMM. exp(estimate) = multiplicative change in exp(H). Terms as in M1."))
+
+#' 
+#' ## M4: Diptera share
+#' 
+#' - **Question.** Does the proportion of Diptera in the catch change across years and seasons, and does this differ between trap types? Since Diptera make up most of the catch, this asks whether the balance between Diptera and all other taxa is stable.
+#' - **Response.** Number of Diptera out of the total number of individuals in each sampled month.
+#' - **Distribution.** Beta-binomial with logit link. A binomial model would assume that each individual is an independent draw. Insects arrive in clumps (swarms, emergences, single nights with large catches), so the variation between months is far larger than binomial: the binomial dispersion ratio is computed below. The beta-binomial adds a parameter for this extra variation. Unlike richness, this over-dispersion is too large to ignore.
+#' - **Specific assumptions.** The log-odds of being a Diptera change linearly with year and smoothly with season. Every individual counts equally, so months with large catches carry more weight.
+#' - **Interpretation of coefficients.** On the log-odds scale; results are reported as predicted percentages.
+#' 
+## ----m4-----------------------------------------------------------------------
+m4_bin <- glmmTMB(update(f_fix, cbind(diptera, N - diptera) ~ . + (1 | region)),
+                  family = binomial, data = div_m)
+disp_m4_bin <- disp_ratio(m4_bin)
+
+m4 <- glmmTMB(update(f_fix, cbind(diptera, N - diptera) ~ . + (1 | region)),
+              family = betabinomial, data = div_m)
+
+#' 
+#' Binomial Pearson dispersion ratio: **`r round(disp_m4_bin, 1)`**, hence the beta-binomial.
+#' 
+## ----m4-coef------------------------------------------------------------------
+coef_tab(m4, paste0("M4. Diptera share, beta-binomial GLMM (log-odds scale). Terms as in M1."))
+
+#' 
+#' \newpage
+#' 
+#' # Results
+#' 
+## ----results-compute----------------------------------------------------------
+## Wald tests (type III)
+wald <- bind_rows(
+  wald_df(m1, "M1 richness"),
+  wald_df(m2, "M2 richness | catch"),
+  wald_df(m3, "M3 Shannon"),
+  wald_df(m4, "M4 Diptera share"))
+
+## % change per year
+pct <- bind_rows(
+  pct_df(m1, "M1 richness"),
+  pct_df(m2, "M2 richness | catch"),
+  pct_df(m3, "M3 exp(H)"))
+
+## Predicted July values at first and last year of each series
+yrs <- div_m |> group_by(trap) |> summarise(first = min(year), last = max(year))
+
+pred_at <- function(tr, yr, mon = 0) {
+  at  <- list(trap = tr, year_c = yr - ref_year, month_c = mon)
+  r   <- summary(emmeans(m1, ~ trap, at = at, type = "response"))
+  h   <- summary(emmeans(m3, ~ trap, at = at))
+  dp  <- summary(emmeans(m4, ~ trap, at = at, type = "response"))
+  data.frame(trap = tr, year = yr,
+    orders   = sprintf("%.1f (%.1f-%.1f)", r[[2]], r$asymp.LCL, r$asymp.UCL),
+    `exp(H)` = sprintf("%.2f (%.2f-%.2f)", exp(h$emmean), exp(h$lower.CL), exp(h$upper.CL)),
+    Diptera  = sprintf("%.0f%% (%.0f-%.0f)", 100 * dp[[2]], 100 * dp$asymp.LCL, 100 * dp$asymp.UCL),
+    check.names = FALSE)
+}
+pred_years <- bind_rows(lapply(seq_len(nrow(yrs)), \(i)
+  bind_rows(pred_at(yrs$trap[i], yrs$first[i]), pred_at(yrs$trap[i], yrs$last[i]))))
+
+## Trap comparison in July of the reference year (M2 at the median catch)
+pred_traps <- bind_rows(lapply(levels(div_m$trap), \(tr) pred_at(tr, ref_year))) |>
+  select(-year)
+med_logN <- median(div_m$logN)
+r2 <- summary(emmeans(m2, ~ trap, at = list(year_c = 0, month_c = 0, logN = med_logN),
+                      type = "response"))
+pred_traps$`orders at median catch` <- sprintf("%.1f (%.1f-%.1f)", r2[[2]], r2$asymp.LCL, r2$asymp.UCL)
+r1_num <- summary(emmeans(m1, ~ trap, at = list(year_c = 0, month_c = 0), type = "response"))
+r2_num <- r2
+
+#' 
+#' ## Year trends
+#' 
+## ----pct-table----------------------------------------------------------------
+tab(blank_rep(pct), "R1. Change per year in order richness and in the effective number of orders, exp(H), with 95\\% confidence intervals.")
+
+#' 
+## ----pred-years-table---------------------------------------------------------
+tab(pred_years, "R2. Predicted values in July at the first and last year of each trap's series (M1, M3, M4), with 95\\% confidence intervals.")
+
+#' 
+#' ## Trap types and season
+#' 
+## ----pred-traps-table---------------------------------------------------------
+tab(pred_traps, paste0("R3. Predicted values per trap type in July ", ref_year, ", with 95\\% confidence intervals. The last column (M2) assumes the same catch size, ", round(exp(med_logN)), " individuals, for every trap."))
+
+#' 
+## ----wald-table---------------------------------------------------------------
+wald_tab <- wald |>
+  mutate(p = format.pval(p_raw, digits = 2, eps = 1e-4)) |>
+  select(response, term, Chisq, Df, p)
+tab(blank_rep(wald_tab), "R4. Type III Wald chi-square tests for each model term.")
+
+#' 
+## ----predictions, fig.height = 7.5, fig.cap = "Predicted values (region effect set to zero) by month, at the median year of each trap's series, with observed sampled months as points."----
+resp_levels <- c("Order richness", "exp(H): effective number of orders", "Diptera share")
+
+yr_med <- div_m |> group_by(trap) |>
+  summarise(year = round(median(year)), m_lo = min(month_n), m_hi = max(month_n))
+
+nd_season <- yr_med |>
+  rowwise() |> reframe(trap, year, month_n = m_lo:m_hi) |>
+  mutate(month_c = month_n - ref_month, year_c = year - ref_year, region = NA,
+         N = 1, diptera = 0)
+
+predict_all <- function(nd) {
+  bind_rows(
+    mutate(nd, response = resp_levels[1],
+           fit = predict(m1, nd, type = "response", re.form = NA)),
+    mutate(nd, response = resp_levels[2],
+           fit = exp(predict(m3, nd, re.form = NA))),
+    mutate(nd, response = resp_levels[3],
+           fit = predict(m4, nd, type = "response", re.form = NA))
+  ) |> mutate(response = factor(response, levels = resp_levels))
+}
+
+obs_long <- div_m |>
+  transmute(trap, year, month_n,
+            `Order richness` = richness,
+            `exp(H): effective number of orders` = hill1,
+            `Diptera share` = diptera_p) |>
+  pivot_longer(-c(trap, year, month_n), names_to = "response", values_to = "value") |>
+  mutate(response = factor(response, levels = resp_levels))
+
+pr_season <- predict_all(nd_season)
+peaks <- pr_season |> group_by(response, trap) |>
+  slice_max(fit, n = 1) |> ungroup() |>
+  mutate(month = month.name[month_n])
+
+ggplot(pr_season, aes(month_n, fit, colour = trap)) +
+  geom_point(data = obs_long, aes(month_n, value), alpha = .25,
+             position = position_jitter(width = .15, height = 0)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ response, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = 4:10, labels = month_levels) +
+  labs(x = NULL, y = NULL, colour = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+
+#' 
+## ----pred-trend, fig.height = 7.5, fig.cap = "Predicted values for July across the years covered by each trap type, with observed sampled months (all calendar months) as points."----
+nd_trend <- div_m |> distinct(trap, year) |>
+  mutate(month_n = ref_month, month_c = 0, year_c = year - ref_year, region = NA,
+         N = 1, diptera = 0)
+ggplot(predict_all(nd_trend), aes(year, fit, colour = trap)) +
+  geom_point(data = obs_long, aes(year, value), alpha = .25,
+             position = position_jitter(width = .2, height = 0)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ response, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = 2014:2025) +
+  labs(x = NULL, y = NULL, colour = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+
+#' 
+## ----interp-values------------------------------------------------------------
+pk <- function(resp, tr) peaks$month[peaks$response == resp & peaks$trap == tr]
+lure <- "BG Sentinel + CO2 + Lure"; co2 <- "BG Sentinel + CO2"
+s1_lure <- r1_num[[2]][r1_num$trap == lure]; s1_co2 <- r1_num[[2]][r1_num$trap == co2]
+s2_lure <- r2_num[[2]][r2_num$trap == lure]; s2_co2 <- r2_num[[2]][r2_num$trap == co2]
+p_m2_season <- min(pnum(wald, "M2 richness | catch", "trap × month"),
+                   pnum(wald, "M2 richness | catch", "trap × month²"))
+
+#' 
+#' ## Interpretation
+#' 
+#' - **No temporal trend.** No response changes with year for any trap type (trap × year: M1 p = `r pv(wald, "M1 richness", "trap × year")`, M3 p = `r pv(wald, "M3 Shannon", "trap × year")`, M4 p = `r pv(wald, "M4 Diptera share", "trap × year")`). For the CO2 trap, the longest series, richness changes by `r fmt_pct(pct, "M1 richness", co2)` and exp(*H*) by `r fmt_pct(pct, "M3 exp(H)", co2)` (Table R1). In July, predicted richness for this trap is `r pred_years$orders[pred_years$trap == co2][1]` orders in `r yrs$first[yrs$trap == co2]` and `r pred_years$orders[pred_years$trap == co2][2]` in `r yrs$last[yrs$trap == co2]` (Table R2).
+#' - **The Yeast trend cannot be estimated.** Its series covers `r n_distinct(div_m$year[div_m$trap == "BG Sentinel + Yeast"])` years; the interval for richness, `r fmt_pct(pct, "M1 richness", "BG Sentinel + Yeast")`, is too wide to support "no trend".
+#' - **The seasonal pattern of richness differs between trap types** in M1 (trap × month p = `r pv(wald, "M1 richness", "trap × month")`; trap × month² p = `r pv(wald, "M1 richness", "trap × month²")`). Predicted richness is highest in `r pk(resp_levels[1], co2)` for CO2, `r pk(resp_levels[1], lure)` for CO2 + Lure and `r pk(resp_levels[1], "BG Sentinel + Yeast")` for Yeast. Once catch size is accounted for (M2), this difference is `r sig_word(p_m2_season)` (smallest p = `r format.pval(p_m2_season, digits = 2)`). `r if (p_m2_season >= 0.05) "The seasonal differences between traps are therefore largely differences in how many individuals each trap catches through the season." else "The seasonal differences between traps persist when catch size is accounted for."`
+#' - **The Lure's higher richness comes from its larger catch.** In July `r ref_year`, CO2 + Lure is predicted to catch `r sprintf("%.1f", s1_lure)` orders against `r sprintf("%.1f", s1_co2)` for CO2 alone (M1, trap p = `r pv(wald, "M1 richness", "trap")`). At the same catch size the difference shrinks to `r sprintf("%.1f", s2_lure)` vs `r sprintf("%.1f", s2_co2)` (M2, trap p = `r pv(wald, "M2 richness | catch", "trap")`). The Lure attracts more individuals, not a more diverse mix of them.
+#' - **Shannon diversity, exp(*H*), is stable.** It does not differ between trap types (p = `r pv(wald, "M3 Shannon", "trap")`) and has at most a weak seasonal signal (month p = `r pv(wald, "M3 Shannon", "month")`; trap × month² p = `r pv(wald, "M3 Shannon", "trap × month²")`).
+#' - **The Diptera share does not change over time or season** (year p = `r pv(wald, "M4 Diptera share", "year")`; month p = `r pv(wald, "M4 Diptera share", "month")`; trap × year p = `r pv(wald, "M4 Diptera share", "trap × year")`). Trap types `r if (pnum(wald, "M4 Diptera share", "trap") < 0.05) "differ slightly in level" else "do not differ"` (p = `r pv(wald, "M4 Diptera share", "trap")`): in July `r ref_year` the predicted share is `r pred_traps$Diptera[pred_traps$trap == co2]` for CO2, `r pred_traps$Diptera[pred_traps$trap == lure]` for CO2 + Lure and `r pred_traps$Diptera[pred_traps$trap == "BG Sentinel + Yeast"]` for Yeast (Table R3). Since Shannon largely tracks the Diptera share (r = `r round(cor_H_dip, 2)`), M3 and M4 tell a similar story.
+#' 
+#' \newpage
+#' 
+#' # Sensitivity analyses
+#' 
+## ----sens---------------------------------------------------------------------
+## S1. Generalised Poisson: does correcting the under-dispersion change M1/M2?
+s1_m1 <- glmmTMB(update(f_fix, richness ~ . + (1 | region)),
+                 family = genpois, data = div_m)
+s1_m2 <- glmmTMB(update(f_fix, richness ~ . + logN + (1 | region)),
+                 family = genpois, data = div_m)
+w_gp  <- bind_rows(wald_df(s1_m1, "M1 richness"), wald_df(s1_m2, "M2 richness | catch"))
+cmp_gp <- wald |>
+  filter(response %in% c("M1 richness", "M2 richness | catch")) |>
+  select(response, term, p_Poisson = p_raw) |>
+  left_join(select(w_gp, response, term, p_genpois = p_raw), by = c("response", "term")) |>
+  mutate(across(starts_with("p_"), \(x) format.pval(x, digits = 2, eps = 1e-4)))
+pct_gp <- pct_df(s1_m1, "M1 richness, generalised Poisson")
+
+## S2. Region as fixed effect: only 4 regions, so the RE variance is barely identifiable
+s2_fe <- glmmTMB(update(f_fix, richness ~ . + region), family = poisson, data = div_m)
+cmp_fe <- data.frame(term = term_lab(names(fixef(m1)$cond)),
+                     random_region = fixef(m1)$cond,
+                     fixed_region  = fixef(s2_fe)$cond[names(fixef(m1)$cond)],
+                     row.names = NULL)
+max_diff_fe <- max(abs(cmp_fe$random_region - cmp_fe$fixed_region))
+
+## S3. Months within a region x year are not independent
+s3_ry <- glmmTMB(update(f_fix, richness ~ . + (1 | region) + (1 | region:year)),
+                 family = poisson, data = div_m)
+aic_ry <- AIC(m1, s3_ry)
+
+#' 
+#' ## S1: generalised Poisson for richness
+#' 
+#' - **Question.** Does ignoring the under-dispersion of richness change the conclusions of M1 and M2?
+#' - **Approach.** Refit M1 and M2 with a generalised Poisson, which estimates the dispersion instead of fixing it at 1.
+#' 
+## ----s1-table-----------------------------------------------------------------
+tab(blank_rep(cmp_gp), "S1. p-values of each term under the Poisson (main models) and the generalised Poisson.")
+
+#' 
+#' - **Year trends do not change.** With the generalised Poisson, the CO2 richness trend is `r fmt_pct(pct_gp, "M1 richness, generalised Poisson", co2)`: same conclusion, narrower interval.
+#' - **The seasonal difference between traps in M2 depends on the distribution.** With the generalised Poisson, trap × month is p = `r cmp_gp$p_genpois[cmp_gp$response == "M2 richness | catch" & cmp_gp$term == "trap × month"]` and trap × month² p = `r cmp_gp$p_genpois[cmp_gp$response == "M2 richness | catch" & cmp_gp$term == "trap × month²"]` in M2, against `r cmp_gp$p_Poisson[cmp_gp$response == "M2 richness | catch" & cmp_gp$term == "trap × month"]` and `r cmp_gp$p_Poisson[cmp_gp$response == "M2 richness | catch" & cmp_gp$term == "trap × month²"]` with the Poisson. This result should be treated as uncertain.
+#' 
+#' ## S2 and S3: region effects
+#' 
+#' - **S2. Question:** does treating region as random matter with only `r nlevels(div_m$region)` regions? Refitting M1 with region as a fixed effect changes coefficients by at most `r signif(max_diff_fe, 2)` on the log scale (Table A1).
+#' - **S3. Question:** are months within the same region and year more alike than the model assumes? Adding a region × year random intercept to M1 gives AIC `r round(aic_ry["s3_ry", "AIC"], 1)` against `r round(aic_ry["m1", "AIC"], 1)` without it, `r if (aic_ry["s3_ry", "AIC"] < aic_ry["m1", "AIC"] - 2) "so it improves the fit; see the caveats." else "so it adds nothing and the independence assumption is acceptable."`
+#' 
+#' ## S4: annual models
+#' 
+#' - **Question.** Does the "no trend" result depend on the seasonal term, or on the uneven number of months sampled per year?
+#' - **Approach.** Counts are summed over a fixed window (July to September) for years in which all three months were sampled; the season term is dropped. June to August would leave the Yeast trap with a single year.
+#' - **Responses and distributions.** Richness adjusted for log catch (Poisson, as M2); richness rarefied to a common number of individuals (Gaussian); Shannon *H* (Gaussian, as M3); Diptera share (beta-binomial, as M4).
+#' - **Assumptions.** A three-month total is comparable across years. Rarefaction assumes that individuals are a random sample from the trap's catch; years below the rarefaction depth are dropped.
+#' 
+## ----sens-annual--------------------------------------------------------------
+window <- c("Jul", "Aug", "Sep")
+n_rare <- 300                           # rarefaction depth (individuals)
+
+ann_counts <- long |>
+  semi_join(div_m, by = c("region", "trap", "year")) |>
+  filter(month %in% window) |>
+  group_by(region, trap, year) |>
+  filter(n_distinct(month) == length(window)) |>
+  group_by(region, trap, year, order) |>
+  summarise(n = sum(n), .groups = "drop")
+
+ann <- ann_counts |>
+  group_by(region, trap, year) |>
+  summarise(N        = sum(n),
+            richness = sum(n > 0),
+            shannon  = { p <- n[n > 0] / sum(n); -sum(p * log(p)) },
+            diptera  = sum(n[order == "Diptera"]),
+            .groups  = "drop") |>
+  mutate(year_c = year - ref_year, logN = log(N),
+         trap = factor(trap), region = factor(region))
+
+## Rarefied richness at n_rare individuals (years below n_rare dropped)
+ann_mat <- ann_counts |>
+  pivot_wider(names_from = order, values_from = n, values_fill = 0)
+ann_mat <- ann_mat[rowSums(ann_mat[, -(1:3)]) >= n_rare, ]
+ann_mat$rich_rare <- as.numeric(vegan::rarefy(ann_mat[, -(1:3)], n_rare))
+ann <- ann |>
+  left_join(ann_mat[, c("region", "trap", "year", "rich_rare")],
+            by = c("region", "trap", "year"))
+
+an_rich <- glmmTMB(richness  ~ trap * year_c + logN + (1 | region),
+                   family = poisson, data = ann)
+an_rare <- glmmTMB(rich_rare ~ trap * year_c + (1 | region),
+                   family = gaussian, data = filter(ann, !is.na(rich_rare)))
+an_shan <- glmmTMB(shannon   ~ trap * year_c + (1 | region),
+                   family = gaussian, data = ann)
+an_dip  <- glmmTMB(cbind(diptera, N - diptera) ~ trap * year_c + (1 | region),
+                   family = betabinomial, data = ann)
+
+## Change per year in natural units:
+##   log-scale responses -> % change; rarefied richness -> orders per year;
+##   Diptera share (logit) -> % change in the odds of being a Diptera
+to_pct <- function(x) 100 * (exp(x) - 1)
+tr_ann <- bind_rows(
+  mutate(trend_df(an_rich), response = "Richness | log catch", unit = "% per year",
+         across(c(slope, lower, upper), to_pct)),
+  mutate(trend_df(an_rare), response = paste0("Rarefied richness (", n_rare, " ind.)"),
+         unit = "orders per year"),
+  mutate(trend_df(an_shan), response = "exp(H)", unit = "% per year",
+         across(c(slope, lower, upper), to_pct)),
+  mutate(trend_df(an_dip),  response = "Diptera share", unit = "% change in odds per year",
+         across(c(slope, lower, upper), to_pct))
+) |>
+  transmute(response, unit, trap, change = slope, lower, upper)
+
+n_ann <- ann |> count(trap)
+n_drop_rare <- sum(is.na(ann$rich_rare))
+any_sig_ann <- any(tr_ann$lower > 0 | tr_ann$upper < 0)
+
+#' 
+#' Years available: `r paste0(n_ann$trap, " ", n_ann$n, collapse = ", ")`; `r n_drop_rare` years fall below `r n_rare` individuals and are dropped from the rarefied model.
+#' 
+## ----annual-table-------------------------------------------------------------
+tab(blank_rep(blank_rep(tr_ann, 2), 1), "S4. Annual models (July to September): change per year with 95\\% confidence intervals.", digits = 2)
+
+#' 
+#' - `r if (any_sig_ann) "**At least one annual trend differs from zero**; see the table." else "**The annual models agree with the monthly ones**: no year trend differs from zero, for any response or trap type."`
+#' - With `r nrow(ann)` rows, the region variance is close to zero in these models; they behave as ordinary GLMs.
+#' 
+#' # Conclusions and caveats
+#' 
+#' - At order level, there is **no detectable change in diversity between 2014 and 2025** for the CO2 and CO2 + Lure traps, whether measured as richness, effective number of orders (exp(*H*)) or Diptera share. For the Yeast trap the series is too short to say.
+#' - **Trap types differ in the seasonal pattern of richness**, but part or all of this reflects how many individuals each trap catches through the season (S1). The Lure's higher richness reflects its larger catch.
+#' - **The balance between Diptera and other taxa is stable** across years and seasons. `r if (pnum(wald, "M4 Diptera share", "trap") < 0.05) "Trap types differ slightly in Diptera share, with the Yeast trap catching proportionally fewer Diptera." else "It also does not differ between trap types."`
+#' - All results are **conditional on the zero-filling assumption and on constant sampling effort**. Richness depends on catch size, so effort data could change the richness results; Shannon and the Diptera share are less affected.
+#' - **Trap type is confounded with region and period**, so trap comparisons are partly comparisons of places and years.
+#' - **Order level is coarse.** With Diptera making up `r round(100 * dip_share)`% of the catch, changes within Diptera (or within any order) are invisible here.
+#' - **Environmental drivers** should wait for effort data, trap coordinates and collection dates.
+#' 
+#' \newpage
+#' 
+#' # Appendix
+#' 
+## ----t6-----------------------------------------------------------------------
+tab(t6_annual, "T6. Catch per year by region and trap type.")
+
+#' 
+## ----fe-table-----------------------------------------------------------------
+tab(cmp_fe, "A1. M1 coefficients with region as random (main model) vs fixed effect (S2).", digits = 3)
+
+#' 
+## ----dharma, eval = requireNamespace("DHARMa", quietly = TRUE), fig.height = 4, fig.cap = "DHARMa residual diagnostics for M1, M3 and M4."----
+## plot(DHARMa::simulateResiduals(m1))
+## plot(DHARMa::simulateResiduals(m3))
+## plot(DHARMa::simulateResiduals(m4))
+

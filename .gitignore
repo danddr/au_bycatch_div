@@ -1,0 +1,16 @@
+# Data: owned by the data collectors, kept local only
+*.xlsx
+*.xls
+*.csv
+
+# R and render by-products
+.Rhistory
+.RData
+.Rproj.user/
+*.log
+*.tex
+*_files/
+*_cache/
+
+# OS clutter
+.DS_Store
